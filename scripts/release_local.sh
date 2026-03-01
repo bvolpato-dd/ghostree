@@ -90,6 +90,17 @@ sign_worktrunk() {
     codesign -f -s "$SIGN_IDENTITY" -o runtime "$wt_dir/git-wt"
 }
 
+sign_plugins() {
+    local plugins="$APP_PATH/Contents/PlugIns"
+    [[ -d "$plugins" ]] || return 0
+
+    log "Signing plugins..."
+    for plugin in "$plugins"/*.plugin; do
+        [[ -d "$plugin" ]] || continue
+        codesign -f -s "$SIGN_IDENTITY" -o runtime "$plugin"
+    done
+}
+
 sign_app() {
     log "Signing app bundle..."
     codesign -f -s "$SIGN_IDENTITY" -o runtime --entitlements "$ENTITLEMENTS" "$APP_PATH"
@@ -131,6 +142,7 @@ main() {
     embed_worktrunk
     sign_sparkle
     sign_worktrunk
+    sign_plugins
     sign_app
     create_dmg
     notarize
