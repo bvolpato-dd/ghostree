@@ -495,7 +495,7 @@ jobs:
             ghostty-source.tar.gz
 
   trigger-snap:
-    if: github.event_name != 'pull_request'
+    if: github.repository == 'ghostty-org/ghostty' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     needs: [build-dist, build-snap]
     steps:
@@ -513,7 +513,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   trigger-flatpak:
-    if: github.event_name != 'pull_request'
+    if: github.repository == 'ghostty-org/ghostty' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     needs: [build-dist, build-flatpak]
     steps:
