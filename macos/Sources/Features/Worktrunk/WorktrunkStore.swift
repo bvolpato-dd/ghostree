@@ -309,6 +309,7 @@ final class WorktrunkStore: ObservableObject {
     private var lastAppQuitTimestamp: Date?
     private var sidebarModelRevisionCounter: Int = 0
     private var refreshAllTask: Task<Void, Never>?
+    private var refreshAllTaskGeneration: UInt64 = 0
     private var refreshAllNeedsRerun: Bool = false
     private var lastRefreshAllCompletedAt: Date = .distantPast
     private let sidebarAppearRefreshInterval: TimeInterval = 20
@@ -560,21 +561,43 @@ final class WorktrunkStore: ObservableObject {
             return
         }
 
+        let shouldScheduleRerun = shouldScheduleRefreshRerun(for: trigger)
         if let existing = refreshAllTask {
-            if shouldScheduleRefreshRerun(for: trigger) {
+            let observedGeneration = refreshAllTaskGeneration
+            if shouldScheduleRerun {
                 refreshAllNeedsRerun = true
             }
             await existing.value
+
+            // Existing task may be complete but still stored here until its creator resumes.
+            if refreshAllTaskGeneration == observedGeneration {
+                refreshAllTask = nil
+            }
+
+            if shouldScheduleRerun, refreshAllNeedsRerun, refreshAllTask == nil {
+                await startRefreshAllTask()
+            }
             return
         }
 
+        await startRefreshAllTask()
+    }
+
+    private func startRefreshAllTask() async {
+        guard refreshAllTask == nil else { return }
+
+        refreshAllTaskGeneration &+= 1
+        let generation = refreshAllTaskGeneration
         let task = Task { [weak self] in
             guard let self else { return }
             await self.refreshAllBatchedLoop()
         }
         refreshAllTask = task
         await task.value
-        refreshAllTask = nil
+
+        if refreshAllTaskGeneration == generation {
+            refreshAllTask = nil
+        }
     }
 
     private struct RefreshListResult {
