@@ -53,12 +53,11 @@ enum AgentHookInstaller {
             content: buildCodexWrapper()
         )
         ensureFile(
-            url: AgentStatusPaths.cursorAgentWrapperPath,
+            url: AgentStatusPaths.copilotCliWrapperPath,
             mode: 0o755,
             marker: wrapperMarker,
-            content: buildCursorAgentWrapper()
+            content: buildCopilotCliWrapper()
         )
-        ensureCursorAgentGlobalHooks(notifyPath: AgentStatusPaths.notifyHookPath.path)
 
         ensureFile(
             url: AgentStatusPaths.opencodeGlobalPluginPath,
@@ -313,14 +312,13 @@ enum AgentHookInstaller {
         """
     }
 
-    private static func buildCursorAgentWrapper() -> String {
+    private static func buildCopilotCliWrapper() -> String {
         let binDir = AgentStatusPaths.binDir.path
         let eventsDir = AgentStatusPaths.eventsCacheDir.path
         return """
         #!/bin/bash
         \(wrapperMarker)
-        # Wrapper for Cursor Agent: emits lifecycle events.
-        # Hook configuration is managed via ~/.cursor/hooks.json.
+        # Wrapper for Copilot CLI: emits Start/Stop lifecycle events.
 
         \(pathAugmentSnippet())
 
@@ -341,72 +339,32 @@ enum AgentHookInstaller {
           return 1
         }
 
-        REAL_BIN="$(find_real_binary "agent")"
+        REAL_BIN="$(find_real_binary "copilot")"
         if [ -z "$REAL_BIN" ]; then
-          REAL_BIN="$(find_real_binary "cursor-agent")"
-        fi
-        if [ -z "$REAL_BIN" ]; then
-          echo "Ghostree: agent (Cursor Agent) not found in PATH. Install it and ensure it is on PATH, then retry." >&2
+          echo "Ghostree: copilot not found in PATH. Install it and ensure it is on PATH, then retry." >&2
           exit 127
         fi
 
-        # Emit synthetic Start event for Cursor Agent
-        printf '{\"timestamp\":\"%s\",\"eventType\":\"Start\",\"cwd\":\"%s\"}\\n' \
-          "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
-          "$(pwd -P 2>/dev/null || pwd)" \
-          >> "${GHOSTREE_AGENT_EVENTS_DIR:-\(eventsDir)}/agent-events.jsonl" 2>/dev/null
+        _EVENTS_DIR="${GHOSTREE_AGENT_EVENTS_DIR:-\(eventsDir)}"
 
-        exec "$REAL_BIN" "$@"
+        # Emit synthetic Start event
+        printf '{\"timestamp\":\"%s\",\"eventType\":\"Start\",\"cwd\":\"%s\"}\\n' \\
+          "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \\
+          "$(pwd -P 2>/dev/null || pwd)" \\
+          >> "$_EVENTS_DIR/agent-events.jsonl" 2>/dev/null
+
+        # Run copilot and capture exit code
+        "$REAL_BIN" "$@"
+        _EXIT=$?
+
+        # Emit synthetic Stop event
+        printf '{\"timestamp\":\"%s\",\"eventType\":\"Stop\",\"cwd\":\"%s\"}\\n' \\
+          "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \\
+          "$(pwd -P 2>/dev/null || pwd)" \\
+          >> "$_EVENTS_DIR/agent-events.jsonl" 2>/dev/null
+
+        exit $_EXIT
         """
-    }
-
-    /// Merges the Ghostree stop hook into ~/.cursor/hooks.json without clobbering
-    /// any existing user hooks.  Idempotent: checks for the marker command before writing.
-    private static func ensureCursorAgentGlobalHooks(notifyPath: String) {
-        let url = AgentStatusPaths.cursorAgentGlobalHooksPath
-        let escapedNotifyPath = notifyPath.replacingOccurrences(of: "'", with: "'\\''")
-        let ghostreeCommand = "bash '\(escapedNotifyPath)'"
-
-        // Read existing file if it exists
-        var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            root = json
-        }
-
-        // Already installed?
-        if let existing = try? String(contentsOf: url, encoding: .utf8),
-           existing.contains(cursorAgentHooksMarker) {
-            return
-        }
-
-        root["version"] = 1
-
-        var hooks = root["hooks"] as? [String: Any] ?? [:]
-        var stopHooks = hooks["stop"] as? [[String: Any]] ?? []
-
-        // Remove any stale Ghostree entries
-        stopHooks.removeAll { entry in
-            guard let cmd = entry["command"] as? String else { return false }
-            return cmd.contains("ghostree") || cmd.contains("Ghostree") || cmd.contains(cursorAgentHooksMarker)
-        }
-
-        // Add the Ghostree hook (tagged so we can find it later)
-        stopHooks.append(["command": ghostreeCommand])
-        hooks["stop"] = stopHooks
-        root["hooks"] = hooks
-
-        // Ensure ~/.cursor directory exists
-        let parentDir = url.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
-
-        guard let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]),
-              var jsonString = String(data: data, encoding: .utf8) else {
-            return
-        }
-
-        jsonString += "\n"
-        try? jsonString.write(to: url, atomically: true, encoding: .utf8)
     }
 
     private static func buildOpenCodePlugin() -> String {

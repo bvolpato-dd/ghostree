@@ -1685,14 +1685,13 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
               let appDelegate = NSApp.delegate as? AppDelegate else { return }
 
         let store = appDelegate.worktrunkStore
-        for repo in store.repositories {
-            if store.worktrees(for: repo.id).contains(where: { $0.path == rootPath }) {
-                let newSelection = SidebarSelection.worktree(repoID: repo.id, path: rootPath)
-                guard worktrunkSidebarState.selection != newSelection else { return }
-                applySyncedWorktrunkSidebarSelection(newSelection)
-                syncWorktrunkSidebarSelectionToTabGroup(newSelection)
-                return
-            }
+        for repo in store.repositories
+            where store.worktrees(for: repo.id).contains(where: { $0.path == rootPath }) {
+            let newSelection = SidebarSelection.worktree(repoID: repo.id, path: rootPath)
+            guard worktrunkSidebarState.selection != newSelection else { return }
+            applySyncedWorktrunkSidebarSelection(newSelection)
+            syncWorktrunkSidebarSelectionToTabGroup(newSelection)
+            return
         }
     }
 
@@ -1962,8 +1961,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             base.command = "codex resume \(session.id)"
         case .opencode:
             base.command = "opencode --session \(session.id)"
-        case .agent:
-            base.command = "agent --resume \(session.id)"
+        case .copilotCli:
+            base.command = "copilot --resume \(session.id)"
         }
 
         if WorktrunkPreferences.worktreeTabsEnabled {

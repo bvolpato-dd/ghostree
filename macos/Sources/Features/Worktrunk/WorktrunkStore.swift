@@ -4,14 +4,14 @@ enum SessionSource: String, Codable {
     case claude
     case codex
     case opencode
-    case agent
+    case copilotCli
 
     var icon: String {
         switch self {
         case .claude: return "terminal"
         case .codex: return "sparkles"
         case .opencode: return "terminal"
-        case .agent: return "cursorarrow.rays"
+        case .copilotCli: return "terminal"
         }
     }
 
@@ -20,7 +20,7 @@ enum SessionSource: String, Codable {
         case .claude: return "Claude"
         case .codex: return "Codex"
         case .opencode: return "OpenCode"
-        case .agent: return "Cursor Agent"
+        case .copilotCli: return "Copilot"
         }
     }
 }
@@ -139,7 +139,7 @@ struct SessionIndex: Codable {
     var claude: [String: SessionIndexEntry] = [:]
     var codex: [String: SessionIndexEntry] = [:]
     var opencode: [String: OpenCodeIndexEntry] = [:]
-    var cursorAgent: [String: CursorAgentIndexEntry] = [:]
+    var copilotCli: [String: SessionIndexEntry] = [:]
 }
 
 final class SessionIndexManager {
@@ -200,6 +200,13 @@ enum WorktrunkSidebarListMode: String {
 }
 
 final class WorktrunkStore: ObservableObject {
+    private enum RefreshAllTrigger {
+        case sidebarAppear
+        case repositoryAdded
+        case worktrunkInstalled
+        case manual
+    }
+
     struct Repository: Identifiable, Codable, Hashable {
         var id: UUID
         var path: String
@@ -316,7 +323,12 @@ final class WorktrunkStore: ObservableObject {
     private var lastAppQuitTimestamp: Date?
     private var sidebarModelRevisionCounter: Int = 0
     private var refreshAllTask: Task<Void, Never>?
+    private var refreshAllTaskGeneration: UInt64 = 0
     private var refreshAllNeedsRerun: Bool = false
+    private var lastRefreshAllCompletedAt: Date = .distantPast
+    private let sidebarAppearRefreshInterval: TimeInterval = 20
+    private let repoListRefreshConcurrency: Int = 4
+    private let gitTrackingRefreshConcurrency: Int = 8
 
     init() {
         load()
@@ -537,7 +549,7 @@ final class WorktrunkStore: ObservableObject {
         save()
         rebuildSidebarSnapshot()
         bumpSidebarModelRevision()
-        Task { await refreshAll() }
+        Task { await refreshAll(trigger: .repositoryAdded) }
     }
 
     func removeRepository(id: UUID) {
@@ -551,23 +563,55 @@ final class WorktrunkStore: ObservableObject {
     }
 
     func refreshAll() async {
+        await refreshAll(trigger: .manual)
+    }
+
+    func refreshForSidebarAppearIfNeeded() async {
+        await refreshAll(trigger: .sidebarAppear)
+    }
+
+    private func refreshAll(trigger: RefreshAllTrigger) async {
+        if trigger == .sidebarAppear, shouldSkipSidebarAppearRefresh() {
+            return
+        }
+
+        let shouldScheduleRerun = shouldScheduleRefreshRerun(for: trigger)
         if let existing = refreshAllTask {
-            refreshAllNeedsRerun = true
+            let observedGeneration = refreshAllTaskGeneration
+            if shouldScheduleRerun {
+                refreshAllNeedsRerun = true
+            }
             await existing.value
-            if refreshAllNeedsRerun {
-                refreshAllNeedsRerun = false
-                await refreshAll()
+
+            // Existing task may be complete but still stored here until its creator resumes.
+            if refreshAllTaskGeneration == observedGeneration {
+                refreshAllTask = nil
+            }
+
+            if shouldScheduleRerun, refreshAllNeedsRerun, refreshAllTask == nil {
+                await startRefreshAllTask()
             }
             return
         }
 
+        await startRefreshAllTask()
+    }
+
+    private func startRefreshAllTask() async {
+        guard refreshAllTask == nil else { return }
+
+        refreshAllTaskGeneration &+= 1
+        let generation = refreshAllTaskGeneration
         let task = Task { [weak self] in
             guard let self else { return }
             await self.refreshAllBatchedLoop()
         }
         refreshAllTask = task
         await task.value
-        refreshAllTask = nil
+
+        if refreshAllTaskGeneration == generation {
+            refreshAllTask = nil
+        }
     }
 
     private struct RefreshListResult {
@@ -587,7 +631,24 @@ final class WorktrunkStore: ObservableObject {
             await refreshAllBatchedOnce()
         } while refreshAllNeedsRerun
         await MainActor.run {
+            lastRefreshAllCompletedAt = Date()
             isRefreshing = false
+        }
+    }
+
+    private func shouldSkipSidebarAppearRefresh() -> Bool {
+        if refreshAllTask != nil {
+            return false
+        }
+        return Date().timeIntervalSince(lastRefreshAllCompletedAt) < sidebarAppearRefreshInterval
+    }
+
+    private func shouldScheduleRefreshRerun(for trigger: RefreshAllTrigger) -> Bool {
+        switch trigger {
+        case .sidebarAppear:
+            return false
+        case .repositoryAdded, .worktrunkInstalled, .manual:
+            return true
         }
     }
 
@@ -607,7 +668,12 @@ final class WorktrunkStore: ObservableObject {
         results.reserveCapacity(repoSnapshot.count)
 
         await withTaskGroup(of: RefreshListResult.self) { group in
-            for repo in repoSnapshot {
+            var nextRepoIndex = 0
+
+            func enqueueNextRepo() {
+                guard nextRepoIndex < repoSnapshot.count else { return }
+                let repo = repoSnapshot[nextRepoIndex]
+                nextRepoIndex += 1
                 let previous = previousByRepoID[repo.id] ?? (hadExisting: false, paths: Set<String>())
                 group.addTask { [self] in
                     do {
@@ -634,8 +700,13 @@ final class WorktrunkStore: ObservableObject {
                 }
             }
 
-            for await result in group {
+            for _ in 0..<min(repoListRefreshConcurrency, repoSnapshot.count) {
+                enqueueNextRepo()
+            }
+
+            while let result = await group.next() {
                 results.append(result)
+                enqueueNextRepo()
             }
         }
 
@@ -664,11 +735,9 @@ final class WorktrunkStore: ObservableObject {
 
                 if result.hadExistingList, !added.isEmpty {
                     let now = Date()
-                    for path in added {
-                        if firstSeenAtByWorktreePath[path] == nil {
-                            firstSeenAtByWorktreePath[path] = now
-                            didChangeFirstSeen = true
-                        }
+                    for path in added where firstSeenAtByWorktreePath[path] == nil {
+                        firstSeenAtByWorktreePath[path] = now
+                        didChangeFirstSeen = true
                     }
                 }
 
@@ -690,8 +759,9 @@ final class WorktrunkStore: ObservableObject {
             repositories.flatMap { worktreesByRepositoryID[$0.id] ?? [] }
         }
 
-        await refreshGitTracking(for: allWorktrees, removing: allPreviousPaths)
-        await refreshSessions()
+        async let trackingRefresh: Void = refreshGitTracking(for: allWorktrees, removing: allPreviousPaths)
+        async let sessionsRefresh: Void = refreshSessions()
+        _ = await (trackingRefresh, sessionsRefresh)
     }
 
     private func decodeWorktrees(repoID: UUID, data: Data) throws -> [Worktree] {
@@ -727,11 +797,9 @@ final class WorktrunkStore: ObservableObject {
                 if hadExistingList, !addedPaths.isEmpty {
                     let now = Date()
                     var didChange = false
-                    for path in addedPaths {
-                        if firstSeenAtByWorktreePath[path] == nil {
-                            firstSeenAtByWorktreePath[path] = now
-                            didChange = true
-                        }
+                    for path in addedPaths where firstSeenAtByWorktreePath[path] == nil {
+                        firstSeenAtByWorktreePath[path] = now
+                        didChange = true
                     }
                     if didChange {
                         saveFirstSeenAt()
@@ -832,7 +900,7 @@ final class WorktrunkStore: ObservableObject {
                 errorMessage = nil
                 needsWorktrunkInstall = false
             }
-            await refreshAll()
+            await refreshAll(trigger: .worktrunkInstalled)
             return true
         } catch {
             await MainActor.run {
@@ -1015,17 +1083,27 @@ final class WorktrunkStore: ObservableObject {
         var results: [String: GitTracking] = [:]
 
         await withTaskGroup(of: (String, GitTracking?).self) { group in
-            for worktree in worktrees {
+            var nextWorktreeIndex = 0
+
+            func enqueueNextWorktree() {
+                guard nextWorktreeIndex < worktrees.count else { return }
+                let worktree = worktrees[nextWorktreeIndex]
+                nextWorktreeIndex += 1
                 group.addTask { [self] in
                     let tracking = try? await getGitTracking(worktreePath: worktree.path)
                     return (worktree.path, tracking)
                 }
             }
 
-            for await (path, tracking) in group {
+            for _ in 0..<min(gitTrackingRefreshConcurrency, worktrees.count) {
+                enqueueNextWorktree()
+            }
+
+            while let (path, tracking) = await group.next() {
                 if let tracking {
                     results[path] = tracking
                 }
+                enqueueNextWorktree()
             }
         }
 
@@ -1051,6 +1129,9 @@ final class WorktrunkStore: ObservableObject {
         let output = try await runGitStatus(worktreePath: worktreePath)
         if output.isEmpty { return nil }
         var parsed = parseGitStatusOutput(output)
+        if parsed.tracking.totalChangesCount == 0 {
+            return parsed.tracking
+        }
 
         let (unstagedAdds, unstagedDeletes) = (try? await runGitNumstat(
             worktreePath: worktreePath,
@@ -1093,14 +1174,13 @@ final class WorktrunkStore: ObservableObject {
             }
         }
 
-        for path in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"] {
-            if FileManager.default.isExecutableFile(atPath: path) {
-                return GitInvocation(
-                    executableURL: URL(fileURLWithPath: path),
-                    arguments: args,
-                    environment: env
-                )
-            }
+        for path in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"]
+            where FileManager.default.isExecutableFile(atPath: path) {
+            return GitInvocation(
+                executableURL: URL(fileURLWithPath: path),
+                arguments: args,
+                environment: env
+            )
         }
 
         let envURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -1397,6 +1477,7 @@ final class WorktrunkStore: ObservableObject {
         var seenClaudePaths = Set<String>()
         var seenCodexPaths = Set<String>()
         var seenOpenCodePaths = Set<String>()
+        var seenCopilotCliPaths = Set<String>()
         var openCodeSlugToWorktreePath: [String: String] = [:]
 
         for path in validWorktreePaths {
@@ -1734,87 +1815,84 @@ final class WorktrunkStore: ObservableObject {
 
         index.opencode = index.opencode.filter { seenOpenCodePaths.contains($0.key) }
 
-        // Scan Cursor Agent sessions (~/.cursor/chats/<md5(worktree_path)>/<uuid>/store.db)
-        // Project hash = MD5 of the workspace path, so we compute hashes for all
-        // known worktree paths and only look at matching directories.
-        var seenAgentPaths = Set<String>()
-        let cursorChatsDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".cursor/chats")
+        // Scan Copilot CLI sessions
+        let copilotCliSessionsDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".copilot/session-state")
 
-        if FileManager.default.fileExists(atPath: cursorChatsDir.path) {
-            var hashToWorktree: [String: String] = [:]
-            for path in validWorktreePaths {
-                let hash = CursorAgentDB.projectHash(for: path)
-                hashToWorktree[hash] = path
-            }
+        if FileManager.default.fileExists(atPath: copilotCliSessionsDir.path),
+           let sessionDirs = try? FileManager.default.contentsOfDirectory(
+               at: copilotCliSessionsDir,
+               includingPropertiesForKeys: [.isDirectoryKey]
+           ) {
+            for sessionDir in sessionDirs {
+                let isDirectory = (try? sessionDir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                guard isDirectory else { continue }
 
-            for (projectHash, worktreePath) in hashToWorktree {
-                let projectDir = cursorChatsDir.appendingPathComponent(projectHash, isDirectory: true)
-                guard FileManager.default.fileExists(atPath: projectDir.path) else { continue }
+                let eventsFile = sessionDir.appendingPathComponent("events.jsonl")
+                guard FileManager.default.fileExists(atPath: eventsFile.path) else { continue }
 
-                let sessionDirs = (try? FileManager.default.contentsOfDirectory(
-                    at: projectDir,
-                    includingPropertiesForKeys: [.isDirectoryKey]
-                ))?.filter {
-                    (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                } ?? []
+                seenCopilotCliPaths.insert(eventsFile.path)
+                guard let attrs = fileAttributes(for: eventsFile) else { continue }
+                let cached = index.copilotCli[eventsFile.path]
 
-                for sessionDir in sessionDirs {
-                    let dbURL = sessionDir.appendingPathComponent("store.db")
-                    guard FileManager.default.fileExists(atPath: dbURL.path) else { continue }
-                    let sessionId = sessionDir.lastPathComponent
-                    let indexKey = dbURL.path
-                    seenAgentPaths.insert(indexKey)
-
-                    guard let attrs = fileAttributes(for: dbURL) else { continue }
-                    let cached = index.cursorAgent[indexKey]
-
-                    if let cached,
-                       cached.dbMtime == attrs.mtime,
-                       cached.dbSize == attrs.size {
+                if let cached,
+                   cached.fileMtime == attrs.mtime,
+                   cached.fileSize == attrs.size {
+                    if let worktreePath = resolveWorktreePath(
+                        cachedPath: cached.worktreePath,
+                        cwd: cached.cwd,
+                        validWorktreePaths: validWorktreePaths
+                    ) {
                         let session = AISession(
                             id: cached.sessionId,
-                            source: .agent,
+                            source: .copilotCli,
                             worktreePath: worktreePath,
-                            cwd: worktreePath,
+                            cwd: cached.cwd,
                             timestamp: cached.timestamp,
-                            snippet: cached.chatName,
-                            sourcePath: dbURL.path,
-                            messageCount: 0
+                            snippet: cached.snippet,
+                            sourcePath: eventsFile.path,
+                            messageCount: cached.messageCount
                         )
                         noteSession(session, worktreePath: worktreePath)
                         if cached.worktreePath != worktreePath {
                             var updated = cached
                             updated.worktreePath = worktreePath
-                            index.cursorAgent[indexKey] = updated
+                            index.copilotCli[eventsFile.path] = updated
                         }
-                        continue
                     }
+                    continue
+                }
 
-                    if let parsed = parseCursorAgentSession(dbURL: dbURL, sessionId: sessionId) {
-                        var session = parsed
+                if var session = parseCopilotCliSession(sessionDir) {
+                    if let worktreePath = resolveWorktreePath(
+                        cachedPath: nil,
+                        cwd: session.cwd,
+                        validWorktreePaths: validWorktreePaths
+                    ) {
                         session.worktreePath = worktreePath
-                        session.cwd = worktreePath
                         noteSession(session, worktreePath: worktreePath)
-                        index.cursorAgent[indexKey] = CursorAgentIndexEntry(
-                            sessionId: sessionId,
-                            projectHash: projectHash,
-                            chatName: parsed.snippet,
+                        index.copilotCli[eventsFile.path] = SessionIndexEntry(
+                            sessionId: session.id,
+                            cwd: session.cwd,
+                            timestamp: session.timestamp,
+                            snippet: session.snippet,
+                            messageCount: session.messageCount,
                             worktreePath: worktreePath,
-                            timestamp: parsed.timestamp,
-                            dbMtime: attrs.mtime,
-                            dbSize: attrs.size
+                            fileMtime: attrs.mtime,
+                            fileSize: attrs.size
                         )
                     } else {
-                        index.cursorAgent[indexKey] = nil
+                        index.copilotCli[eventsFile.path] = nil
                     }
+                } else {
+                    index.copilotCli[eventsFile.path] = nil
                 }
             }
         } else {
-            index.cursorAgent = [:]
+            index.copilotCli = [:]
         }
 
-        index.cursorAgent = index.cursorAgent.filter { seenAgentPaths.contains($0.key) }
+        index.copilotCli = index.copilotCli.filter { seenCopilotCliPaths.contains($0.key) }
 
         // Final sort and single publish
         sortDirtySessions()
@@ -2070,31 +2148,130 @@ final class WorktrunkStore: ObservableObject {
         )
     }
 
-    // MARK: - Cursor Agent Sessions
+    // MARK: - Copilot CLI Sessions
 
-    private func parseCursorAgentSession(dbURL: URL, sessionId: String) -> AISession? {
-        guard let db = try? CursorAgentDB(path: dbURL.path) else { return nil }
-        defer { db.close() }
+    private func parseCopilotCliWorkspaceYaml(_ url: URL) -> (id: String, cwd: String, summary: String?)? {
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        var id: String?
+        var cwd: String?
+        var summary: String?
 
-        guard let meta = db.readMeta() else { return nil }
-        let createdAt = meta.createdAt.map { Date(timeIntervalSince1970: $0 / 1000.0) }
+        for line in content.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if let colonIdx = trimmed.firstIndex(of: ":") {
+                let key = String(trimmed[trimmed.startIndex..<colonIdx]).trimmingCharacters(in: .whitespaces)
+                let value = String(trimmed[trimmed.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
+                if value.isEmpty { continue }
+                switch key {
+                case "id": id = value
+                case "cwd": cwd = value
+                case "summary": summary = value
+                default: break
+                }
+            }
+        }
 
-        let dbModDate: Date? = {
-            guard let attrs = try? FileManager.default.attributesOfItem(atPath: dbURL.path),
-                  let mdate = attrs[.modificationDate] as? Date else { return nil }
-            return mdate
-        }()
-        let timestamp = dbModDate ?? createdAt ?? Date.distantPast
+        guard let id, let cwd else { return nil }
+        return (id, cwd, summary)
+    }
+
+    private func parseCopilotCliSession(_ sessionDir: URL) -> AISession? {
+        let workspaceFile = sessionDir.appendingPathComponent("workspace.yaml")
+        let eventsFile = sessionDir.appendingPathComponent("events.jsonl")
+
+        guard let workspace = parseCopilotCliWorkspaceYaml(workspaceFile) else { return nil }
+
+        let eventsURL = eventsFile
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: eventsURL.path),
+              let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 else { return nil }
+        let size = Int64((attrs[.size] as? UInt64) ?? (attrs[.size] as? Int).map { UInt64($0) } ?? 0)
+
+        // Check cache
+        if let cached = sessionCache.get(eventsURL.path),
+           sessionCache.isCacheValid(entry: cached, mtime: mtime, size: size) {
+            return AISession(
+                id: cached.sessionId,
+                source: .copilotCli,
+                worktreePath: "",
+                cwd: cached.cwd,
+                timestamp: cached.timestamp,
+                snippet: cached.snippet,
+                sourcePath: eventsURL.path,
+                messageCount: cached.messageCount
+            )
+        }
+
+        // Parse events.jsonl
+        guard let handle = try? FileHandle(forReadingFrom: eventsURL) else { return nil }
+        defer { try? handle.close() }
+
+        var timestamp: Date?
+        var snippet: String?
+        var messageCount = 0
+
+        let data = handle.readData(ofLength: 50_000)
+        let content = String(data: data, encoding: .utf8) ?? ""
+
+        for line in content.components(separatedBy: "\n").prefix(200) {
+            guard !line.isEmpty,
+                  let lineData = line.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+
+            if let ts = json["timestamp"] as? String, let parsed = parseRFC3339(ts) {
+                timestamp = parsed
+            }
+
+            let entryType = json["type"] as? String
+            if entryType == "user.message",
+               let eventData = json["data"] as? [String: Any] {
+                messageCount += 1
+                if snippet == nil, let text = eventData["content"] as? String {
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        snippet = String(trimmed.prefix(60))
+                    }
+                }
+            }
+        }
+
+        // For large files, count remaining user messages and get last timestamp
+        if size > 50_000 {
+            messageCount += grepCountUserMessages(url: eventsURL, pattern: "\"type\":\"user.message\"", skipBytes: 50_000)
+            if let tailTs = lastTimestampFromTail(url: eventsURL, fileSize: size) {
+                timestamp = tailTs
+            }
+        }
+
+        // Use workspace summary as snippet if events didn't yield one
+        if snippet == nil, let summary = workspace.summary, !summary.isEmpty {
+            snippet = String(summary.prefix(60))
+        }
+
+        let ts = timestamp ?? Date.distantPast
+
+        // Update cache
+        let cacheEntry = SessionCacheEntry(
+            sessionId: workspace.id,
+            source: "copilotCli",
+            cwd: workspace.cwd,
+            timestamp: ts,
+            snippet: snippet,
+            messageCount: messageCount,
+            lastParsedOffset: Int64(size),
+            fileMtime: mtime,
+            fileSize: size
+        )
+        sessionCache.set(eventsURL.path, cacheEntry)
 
         return AISession(
-            id: sessionId,
-            source: .agent,
+            id: workspace.id,
+            source: .copilotCli,
             worktreePath: "",
-            cwd: "",
-            timestamp: timestamp,
-            snippet: meta.name,
-            sourcePath: dbURL.path,
-            messageCount: 0
+            cwd: workspace.cwd,
+            timestamp: ts,
+            snippet: snippet,
+            sourcePath: eventsURL.path,
+            messageCount: messageCount
         )
     }
 

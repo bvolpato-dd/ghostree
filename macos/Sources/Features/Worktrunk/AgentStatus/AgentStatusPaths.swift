@@ -46,14 +46,8 @@ enum AgentStatusPaths {
         binDir.appendingPathComponent("codex")
     }
 
-    static var cursorAgentWrapperPath: URL {
-        binDir.appendingPathComponent("agent")
-    }
-
-    static var cursorAgentGlobalHooksPath: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".cursor", isDirectory: true)
-            .appendingPathComponent("hooks.json", isDirectory: false)
+    static var copilotCliWrapperPath: URL {
+        binDir.appendingPathComponent("copilot")
     }
 
     static var opencodePluginMarker: String { "// Ghostree opencode plugin v5" }

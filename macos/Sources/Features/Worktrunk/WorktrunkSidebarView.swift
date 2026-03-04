@@ -194,7 +194,7 @@ struct WorktrunkSidebarView: View {
                 )
             }
             clearSelectionIfMainInFlatMode()
-            Task { await store.refreshAll() }
+            Task { await store.refreshForSidebarAppearIfNeeded() }
         }
         .alert(
             "Remove Repository?",
@@ -303,10 +303,8 @@ struct WorktrunkSidebarView: View {
     private func findWorktree(forWorktreeRootPath rootPath: String) -> WorktrunkStore.Worktree? {
         let root = standardizedPath(rootPath)
         for repo in store.repositories {
-            for wt in store.worktrees(for: repo.id) {
-                if standardizedPath(wt.path) == root {
-                    return wt
-                }
+            for wt in store.worktrees(for: repo.id) where standardizedPath(wt.path) == root {
+                return wt
             }
         }
         return nil
